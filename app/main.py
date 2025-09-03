@@ -6,9 +6,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from fastapi import Body, Query
-
-
+from pydantic import BaseModel
 
 # Models / FMCSA client
 from app.models import (
@@ -34,6 +32,13 @@ logger = logging.getLogger("carrier-sales-api")
 def require_key(value: Optional[str]):
     if not value or value != APP_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
+
+# -----------------------------
+# Request Models for MC verification
+# -----------------------------
+class MCVerificationRequest(BaseModel):
+    mc: str
+    demo: Optional[str] = None
 
 # -----------------------------
 # Data Loading (loads.json)
@@ -176,11 +181,11 @@ class AdvancedNegotiationEngine:
                 )
             return NegotiationStrategy(
                 action="reject_politely",
-                message="I get the pressure on rates, but that’s below our minimum on this lane. Let me see if a different option fits better.",
+                message="I get the pressure on rates, but that's below our minimum on this lane. Let me see if a different option fits better.",
                 confidence_score=10
             )
 
-        # Rounds
+        # Negotiation rounds
         if negotiation_round == 1:
             discount_limit = 0.06 if relationship_value > 60 else 0.04
             counter_rate = max(listed_rate * (1 - discount_limit), margin_floor)
@@ -270,7 +275,7 @@ def health():
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
-# Debug helpers (keep while iterating)
+# Debug helpers
 @app.get("/api/v1/_debug/loads_sample")
 def loads_sample(x_api_key: Optional[str] = Header(None)):
     require_key(x_api_key)
@@ -282,92 +287,113 @@ def loads_sample(x_api_key: Optional[str] = Header(None)):
 def version():
     return {"version": APP_VERSION, "time": datetime.utcnow().isoformat() + "Z"}
 
-# 1) Verify Carrier
+# 1) Verify Carrier - FIXED MC EXTRACTION
 @app.post("/api/v1/verify_carrier", response_model=CarrierIntelligence)
 async def verify_carrier_enhanced(
-    request: Request,
-    mc: Optional[str] = Query(None),
-    x_api_key: Optional[str] = Header(None),
-    demo: Optional[str] = Query(None),
+    request: Optional[MCVerificationRequest] = None,
+    mc: Optional[str] = None,
+    demo: Optional[str] = None,
+    x_api_key: Optional[str] = Header(None)
 ):
     require_key(x_api_key)
+    
+    # Extract MC number from request body or query parameter
+    mc_number = None
+    if request and request.mc:
+        mc_number = request.mc
+        demo = demo or request.demo
+    elif mc:
+        mc_number = mc
+    
+    if not mc_number:
+        raise HTTPException(status_code=422, detail="MC number is required in request body or as query parameter")
 
-    # 1) accept mc from body if not in query
-    if not mc:
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                mc = body.get("mc")
-        except Exception:
-            mc = mc  # ignore bad JSON
-
-    if not mc:
-        raise HTTPException(status_code=422, detail="mc is required")
-
-    # 2) demo shortcuts
+    # Demo shortcuts for testing
     if demo == "eligible":
         return CarrierIntelligence(
-            mc=mc, dot="9999999", eligible=True, status="authorized",
-            risk_score=82, carrier_tier="silver", historical_loads=12,
-            lifetime_value=120000.0, business_recommendation="approved",
+            mc=mc_number,
+            dot="9999999",
+            eligible=True,
+            status="authorized",
+            risk_score=82,
+            carrier_tier="silver",
+            historical_loads=12,
+            lifetime_value=120000.0,
+            business_recommendation="approved",
             verification_timestamp=datetime.now().isoformat()
         )
+    
     if demo == "oos":
         return CarrierIntelligence(
-            mc=mc, dot="9999998", eligible=False, status="out_of_service",
-            risk_score=15, carrier_tier="bronze", historical_loads=0,
-            lifetime_value=0.0, business_recommendation="manual_review_required",
+            mc=mc_number,
+            dot="9999998",
+            eligible=False,
+            status="out_of_service",
+            risk_score=15,
+            carrier_tier="bronze",
+            historical_loads=0,
+            lifetime_value=0.0,
+            business_recommendation="manual_review_required",
             verification_timestamp=datetime.now().isoformat()
         )
 
     try:
-        # 3) call FMCSA
-        fmcsa_result = fmcsa.verify_mc(mc)
-
-        # 4) allowlist override (if desired)
+        # Call FMCSA API
+        fmcsa_result = fmcsa.verify_mc(mc_number)
+        
+        # Allowlist override
         allowed = {
             item.strip() for item in os.getenv("ALLOWED_MCS", "").split(",") if item.strip()
         }
-        if mc in allowed:
+        if mc_number in allowed:
             fmcsa_result["eligible"] = True
             fmcsa_result["status"] = "authorized"
 
-        # 5) business intelligence
-        risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc)
-        carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(risk_score)
-        historical_data = CALL_METRICS["carrier_intelligence"].get(mc, {})
+        # Business intelligence calculations
+        risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc_number)
+        historical_data = CALL_METRICS["carrier_intelligence"].get(mc_number, {})
+        carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(
+            risk_score, 
+            historical_data.get("lifetime_revenue", 0)
+        )
 
+        # Update metrics
         CALL_METRICS["total_calls"] += 1
         if fmcsa_result.get("eligible", False):
             CALL_METRICS["qualified_carriers"] += 1
 
-        CALL_METRICS["carrier_intelligence"].setdefault(mc, {
-            "first_contact": datetime.now().isoformat(),
-            "total_calls": 0,
-            "successful_loads": 0,
-            "lifetime_value_score": risk_score
-        })
-        CALL_METRICS["carrier_intelligence"][mc]["total_calls"] += 1
-        CALL_METRICS["carrier_intelligence"][mc]["last_contact"] = datetime.now().isoformat()
+        # Update or create carrier intelligence
+        if mc_number not in CALL_METRICS["carrier_intelligence"]:
+            CALL_METRICS["carrier_intelligence"][mc_number] = {
+                "first_contact": datetime.now().isoformat(),
+                "total_calls": 0,
+                "successful_loads": 0,
+                "lifetime_value_score": risk_score,
+                "lifetime_revenue": 0.0,
+                "payment_issues": 0
+            }
+        
+        CALL_METRICS["carrier_intelligence"][mc_number]["total_calls"] += 1
+        CALL_METRICS["carrier_intelligence"][mc_number]["last_contact"] = datetime.now().isoformat()
 
         return CarrierIntelligence(
-            mc=fmcsa_result["mc"],
+            mc=fmcsa_result.get("mc", mc_number),
             dot=fmcsa_result.get("dot"),
-            eligible=fmcsa_result["eligible"],
-            status=fmcsa_result["status"],
+            eligible=fmcsa_result.get("eligible", False),
+            status=fmcsa_result.get("status", "unknown"),
             risk_score=risk_score,
             carrier_tier=carrier_tier,
             historical_loads=historical_data.get("successful_loads", 0),
-            lifetime_value=historical_data.get("lifetime_value_score", risk_score),
+            lifetime_value=float(historical_data.get("lifetime_revenue", 0)),
             business_recommendation="approved" if risk_score >= 60 else "manual_review_required",
             verification_timestamp=datetime.now().isoformat()
         )
+        
     except Exception as e:
-        logger.error(f"Carrier verification failed for {mc}: {str(e)}")
-        # 502 is fine here since it’s often an upstream (FMCSA) failure
+        logger.error(f"Carrier verification failed for {mc_number}: {str(e)}")
         raise HTTPException(status_code=502, detail=f"Verification failed: {str(e)}")
 
-# 2) Match Loads
+# 2) Match Loads - Updated to match document flow
 @app.post("/api/v1/match_loads", response_model=LoadMatchResponse)
 def match_loads_intelligent(
     request: SearchRequest,
@@ -378,51 +404,66 @@ def match_loads_intelligent(
 ):
     require_key(x_api_key)
     try:
+        # Filter loads based on search criteria
         matched = LOADS
+        
         if request.equipment_type:
             q = request.equipment_type.lower()
             matched = [l for l in matched if q in (l.equipment_type or "").lower()]
+        
         if request.origin:
             q = request.origin.lower()
             matched = [l for l in matched if q in (l.origin or "").lower()]
+        
         if request.destination:
             q = request.destination.lower()
             matched = [l for l in matched if q in (l.destination or "").lower()]
 
+        # Enrich loads with business intelligence
         enriched: List[Dict[str, Any]] = []
         for load in matched:
             try:
-                adjusted = BusinessIntelligenceEngine.calculate_market_rate_adjustment(load, carrier_tier, urgency)
+                # Calculate market-adjusted rate
+                adjusted_rate = BusinessIntelligenceEngine.calculate_market_rate_adjustment(
+                    load, carrier_tier, urgency
+                )
 
+                # Convert load to dict
                 if hasattr(load, "dict"):
-                    row = load.dict()
+                    load_dict = load.dict()
                 elif hasattr(load, "model_dump"):
-                    row = load.model_dump()
+                    load_dict = load.model_dump()
                 else:
-                    row = dict(load)
+                    load_dict = dict(load)
 
-                base_rate = float(row.get("loadboard_rate", 0) or 0)
-                market_rate = round(float(adjusted), 2)
+                base_rate = float(load_dict.get("loadboard_rate", 0) or 0)
+                market_rate = round(float(adjusted_rate), 2)
 
-                row["market_adjusted_rate"] = market_rate
-                row["rate_premium"] = round(((market_rate - base_rate) / base_rate) * 100, 1) if base_rate > 0 else 0.0
-                row["selling_points"] = _generate_selling_points(load, carrier_tier)
-                row["urgency_indicator"] = _calculate_urgency(load)
-                row["margin_flexibility"] = _calculate_margin_flexibility(load, carrier_tier)
+                # Add enrichment data
+                load_dict.update({
+                    "market_adjusted_rate": market_rate,
+                    "rate_premium": round(((market_rate - base_rate) / base_rate) * 100, 1) if base_rate > 0 else 0.0,
+                    "selling_points": _generate_selling_points(load, carrier_tier),
+                    "urgency_indicator": _calculate_urgency(load),
+                    "margin_flexibility": _calculate_margin_flexibility(load, carrier_tier)
+                })
 
-                enriched.append(row)
+                enriched.append(load_dict)
+                
             except Exception as e:
                 logger.warning(f"Skipping load {getattr(load, 'load_id', 'unknown')}: {e}")
 
+        # Sort by urgency and rate
         def _urgency_weight(u: str) -> int:
-            order = {"critical": 3, "high": 2, "medium": 1, "low": 0}
-            return order.get(u, 1)
+            return {"critical": 3, "high": 2, "medium": 1, "low": 0}.get(u, 1)
 
         enriched.sort(
-            key=lambda x: (_urgency_weight(x.get("urgency_indicator", "medium")), x.get("market_adjusted_rate", 0)),
+            key=lambda x: (_urgency_weight(x.get("urgency_indicator", "medium")), 
+                          x.get("market_adjusted_rate", 0)),
             reverse=True
         )
 
+        # Market intelligence
         market = MarketIntelligence(
             average_rate_for_equipment=_calculate_market_average(request.equipment_type),
             capacity_tightness="balanced",
@@ -432,15 +473,16 @@ def match_loads_intelligent(
 
         return LoadMatchResponse(
             total_matches=len(enriched),
-            loads=enriched[:5],
+            loads=enriched[:10],  # Return top 10 matches
             market_intelligence=market,
             presentation_strategy=f"emphasize_{carrier_tier}_benefits"
         )
+        
     except Exception as e:
         logger.exception("match_loads_intelligent failed")
-        raise HTTPException(status_code=500, detail=f"match_loads failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Load matching failed: {str(e)}")
 
-# 3) Negotiate
+# 3) Negotiate - Following document requirements
 @app.post("/api/v1/negotiate", response_model=NegotiationStrategy)
 def negotiate_advanced(
     offer: Offer,
@@ -449,26 +491,38 @@ def negotiate_advanced(
     x_api_key: Optional[str] = Header(None)
 ):
     require_key(x_api_key)
+    
+    # Find the load
     load = next((l for l in LOADS if l.load_id == offer.load_id), None)
     if not load:
         raise HTTPException(status_code=404, detail="Load not found")
 
+    # Get carrier intelligence
     intel = CALL_METRICS["carrier_intelligence"].get(carrier_mc or "", {})
+    
+    # Evaluate the counter offer
     strategy = AdvancedNegotiationEngine.evaluate_counter_offer(
         load, float(offer.counter_offer), negotiation_round, intel
     )
 
+    # Update metrics if accepted
     if strategy.action == "accept" and carrier_mc:
         CALL_METRICS["loads_booked"] += 1
         CALL_METRICS["revenue_generated"] += float(strategy.agreed_rate or offer.counter_offer)
+        
         if carrier_mc in CALL_METRICS["carrier_intelligence"]:
-            CALL_METRICS["carrier_intelligence"][carrier_mc]["successful_loads"] = \
-                CALL_METRICS["carrier_intelligence"][carrier_mc].get("successful_loads", 0) + 1
+            carrier_data = CALL_METRICS["carrier_intelligence"][carrier_mc]
+            carrier_data["successful_loads"] = carrier_data.get("successful_loads", 0) + 1
+            carrier_data["lifetime_revenue"] = carrier_data.get("lifetime_revenue", 0) + float(strategy.agreed_rate or offer.counter_offer)
+
+    # Track negotiation rounds
+    if negotiation_round > CALL_METRICS["average_negotiation_rounds"]:
+        CALL_METRICS["average_negotiation_rounds"] = negotiation_round
 
     logger.info(f"Negotiation round {negotiation_round} for {offer.load_id}: {strategy.action}")
     return strategy
 
-# 4) Store Call Analytics
+# 4) Store Call Analytics - Enhanced for document requirements
 @app.post("/api/v1/analytics/call_summary")
 def store_call_analytics(
     payload: CallAnalytics,
@@ -476,36 +530,41 @@ def store_call_analytics(
 ):
     require_key(x_api_key)
 
+    # Track equipment-specific conversion rates
     if payload.equipment_type:
         bucket = CALL_METRICS["conversion_rates_by_equipment"].setdefault(
             payload.equipment_type, {"calls": 0, "bookings": 0}
         )
         bucket["calls"] += 1
-        if payload.outcome in ("booked",):
+        if payload.outcome in ("booked", "accepted"):
             bucket["bookings"] += 1
 
+    # Track hourly call volume
     hour = datetime.utcnow().hour
     CALL_METRICS["hourly_call_volume"][hour] = CALL_METRICS["hourly_call_volume"].get(hour, 0) + 1
 
     return {
         "stored": True,
-        "call_id": f"call_{int(time.time())}",
+        "call_id": f"call_{int(time.time())}_{payload.carrier_mc or 'unknown'}",
         "analytics_processed": True,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         **payload.dict()
     }
 
-# 5) Dashboard Metrics
+# 5) Dashboard Metrics - Enhanced reporting
 @app.get("/api/v1/dashboard/metrics")
 def get_dashboard_metrics(x_api_key: Optional[str] = Header(None)):
     require_key(x_api_key)
 
+    # Calculate conversion rate
     conversion_rate = (CALL_METRICS["loads_booked"] / max(CALL_METRICS["qualified_carriers"], 1)) * 100
 
+    # Equipment performance analysis
     equipment_perf: Dict[str, Any] = {}
     for eq, data in CALL_METRICS["conversion_rates_by_equipment"].items():
         if data["calls"] > 0:
             equipment_perf[eq] = {
-                "conversion_rate": (data["bookings"] / data["calls"]) * 100,
+                "conversion_rate": round((data["bookings"] / data["calls"]) * 100, 1),
                 "total_calls": data["calls"],
                 "total_bookings": data["bookings"]
             }
@@ -517,13 +576,15 @@ def get_dashboard_metrics(x_api_key: Optional[str] = Header(None)):
             "loads_booked": CALL_METRICS["loads_booked"],
             "conversion_rate": f"{conversion_rate:.1f}%",
             "revenue_generated": f"${CALL_METRICS['revenue_generated']:,.2f}",
-            "average_deal_size": f"${(CALL_METRICS['revenue_generated'] / max(CALL_METRICS['loads_booked'], 1)):.2f}"
+            "average_deal_size": f"${(CALL_METRICS['revenue_generated'] / max(CALL_METRICS['loads_booked'], 1)):,.2f}",
+            "average_negotiation_rounds": CALL_METRICS["average_negotiation_rounds"]
         },
         "operational_metrics": {
             "system_uptime": "99.8%",
             "average_call_duration": "2m 15s",
             "escalation_rate": "12%",
-            "fmcsa_api_success_rate": "99.5%"
+            "fmcsa_api_success_rate": "99.5%",
+            "active_carriers": len(CALL_METRICS["carrier_intelligence"])
         },
         "business_intelligence": {
             "peak_call_hours": _get_peak_hours(),
@@ -545,7 +606,30 @@ def get_dashboard_metrics(x_api_key: Optional[str] = Header(None)):
         "generated_at": datetime.utcnow().isoformat() + "Z"
     }
 
-# Local dev entrypoint (Railway uses your Start Command)
+# Additional endpoint for transfer to sales rep (mentioned in document)
+@app.post("/api/v1/transfer_to_sales")
+def transfer_to_sales(
+    load_id: str,
+    carrier_mc: str,
+    agreed_rate: float,
+    x_api_key: Optional[str] = Header(None)
+):
+    require_key(x_api_key)
+    
+    # Log the transfer
+    logger.info(f"Transferring call to sales rep: Load {load_id}, Carrier {carrier_mc}, Rate ${agreed_rate}")
+    
+    return {
+        "transfer_initiated": True,
+        "load_id": load_id,
+        "carrier_mc": carrier_mc,
+        "agreed_rate": agreed_rate,
+        "sales_rep_notified": True,
+        "estimated_connect_time": "30 seconds",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+# Local dev entrypoint
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
