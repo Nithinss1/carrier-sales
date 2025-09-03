@@ -301,6 +301,11 @@ def verify_carrier_enhanced(
 
     if not mc:
         raise HTTPException(status_code=422, detail="mc is required")
+    
+    allowed = set(os.getenv("ALLOWED_MCS", "").split(","))
+    if mc in allowed:
+        fmcsa_result["eligible"] = True
+        fmcsa_result["status"] = "authorized"
 
     # NEW: simple demo overrides
     if demo == "eligible":
