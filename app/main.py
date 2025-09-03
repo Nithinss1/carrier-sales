@@ -8,6 +8,8 @@ from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from fastapi import Body
+from fastapi import Query
+
 
 
 # Models / FMCSA client
@@ -285,17 +287,37 @@ def version():
 # 1) Verify Carrier
 @app.post("/api/v1/verify_carrier", response_model=CarrierIntelligence)
 def verify_carrier_enhanced(
-    mc: Optional[str] = None,
-    payload: Optional[dict] = Body(default=None),
+    mc: Optional[str] = Query(None),
+    payload: Optional[dict] = None,
     x_api_key: Optional[str] = Header(None),
+    demo: Optional[str] = Query(None),  # <-- NEW
     background_tasks: BackgroundTasks = None
 ):
     require_key(x_api_key)
 
-    # Allow mc from query OR body
-    mc = mc or (payload or {}).get("mc")
+    # NEW: read mc from JSON body if not in query
+    if not mc and payload and isinstance(payload, dict):
+        mc = payload.get("mc")
+
     if not mc:
-        raise HTTPException(status_code=400, detail="mc is required (query or JSON body)")
+        raise HTTPException(status_code=422, detail="mc is required")
+
+    # NEW: simple demo overrides
+    if demo == "eligible":
+        return CarrierIntelligence(
+            mc=mc, dot="9999999", eligible=True, status="authorized",
+            risk_score=82, carrier_tier="silver", historical_loads=12,
+            lifetime_value=120000.0, business_recommendation="approved",
+            verification_timestamp=datetime.now().isoformat()
+        )
+    if demo == "oos":
+        return CarrierIntelligence(
+            mc=mc, dot="9999998", eligible=False, status="out_of_service",
+            risk_score=15, carrier_tier="bronze", historical_loads=0,
+            lifetime_value=0.0, business_recommendation="manual_review_required",
+            verification_timestamp=datetime.now().isoformat()
+        )
+
 
     try:
         fmcsa_result = fmcsa.verify_mc(mc)
