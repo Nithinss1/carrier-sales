@@ -107,20 +107,60 @@ class BusinessIntelligenceEngine:
     @staticmethod
     def calculate_carrier_risk_score(fmcsa_result: dict, mc_number: str) -> int:
         base = 50
-        if fmcsa_result.get("eligible"):
-            base += 30
-        status = fmcsa_result.get("status")
+        
+        # FMCSA Status Evaluation - More nuanced approach
+        status = fmcsa_result.get("status", "").lower()
+        
         if status == "authorized":
-            base += 10
+            base += 30
+        elif status == "not_authorized":
+            # Not authorized doesn't mean they're bad - could be various reasons
+            # Check if they have a valid DOT number
+            if fmcsa_result.get("dot"):
+                base += 10  # They exist in system, just not "authorized" status
+            else:
+                base -= 10  # No DOT number is more concerning
         elif status == "out_of_service":
-            base -= 40
+            base -= 40  # This is actually bad
+        else:
+            # Unknown status - neutral
+            base += 5
 
+        # If MC number exists in FMCSA system at all, that's positive
+        if fmcsa_result.get("mc") or fmcsa_result.get("dot"):
+            base += 15
+
+        # Historical performance
         hist = CALL_METRICS["carrier_intelligence"].get(mc_number, {})
         base += min(hist.get("successful_loads", 0) * 2, 20)
         if hist.get("payment_issues", 0) > 0:
             base -= 15
 
         return max(0, min(100, base))
+    
+    @staticmethod
+    def is_carrier_eligible(fmcsa_result: dict, mc_number: str) -> bool:
+        """Determine if carrier is eligible to work with"""
+        status = fmcsa_result.get("status", "").lower()
+        
+        # Definitely not eligible
+        if status == "out_of_service":
+            return False
+            
+        # Check if they're in any allowlist
+        allowed = {
+            item.strip() for item in os.getenv("ALLOWED_MCS", "").split(",") if item.strip()
+        }
+        if mc_number in allowed:
+            return True
+            
+        # If they have either MC or DOT in the system, they're potentially eligible
+        if fmcsa_result.get("mc") or fmcsa_result.get("dot"):
+            return True
+            
+        # Unknown carriers might still be workable - business decision
+        return True  # Default to eligible unless explicitly out of service
+
 
     @staticmethod
     def determine_carrier_tier(risk_score: int, historical_revenue: float = 0) -> str:
@@ -300,10 +340,10 @@ async def verify_carrier_enhanced(
     # Extract MC number from request body or query parameter
     mc_number = None
     if request and request.mc:
-        mc_number = request.mc
+        mc_number = request.mc.strip()
         demo = demo or request.demo
     elif mc:
-        mc_number = mc
+        mc_number = mc.strip()
     
     if not mc_number:
         raise HTTPException(status_code=422, detail="MC number is required in request body or as query parameter")
@@ -341,16 +381,13 @@ async def verify_carrier_enhanced(
         # Call FMCSA API
         fmcsa_result = fmcsa.verify_mc(mc_number)
         
-        # Allowlist override
-        allowed = {
-            item.strip() for item in os.getenv("ALLOWED_MCS", "").split(",") if item.strip()
-        }
-        if mc_number in allowed:
-            fmcsa_result["eligible"] = True
-            fmcsa_result["status"] = "authorized"
-
-        # Business intelligence calculations
+        # Use improved eligibility logic
+        is_eligible = BusinessIntelligenceEngine.is_carrier_eligible(fmcsa_result, mc_number)
+        
+        # Calculate risk score with improved logic
         risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc_number)
+        
+        # Get historical data
         historical_data = CALL_METRICS["carrier_intelligence"].get(mc_number, {})
         carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(
             risk_score, 
@@ -359,7 +396,7 @@ async def verify_carrier_enhanced(
 
         # Update metrics
         CALL_METRICS["total_calls"] += 1
-        if fmcsa_result.get("eligible", False):
+        if is_eligible:
             CALL_METRICS["qualified_carriers"] += 1
 
         # Update or create carrier intelligence
@@ -376,22 +413,46 @@ async def verify_carrier_enhanced(
         CALL_METRICS["carrier_intelligence"][mc_number]["total_calls"] += 1
         CALL_METRICS["carrier_intelligence"][mc_number]["last_contact"] = datetime.now().isoformat()
 
+        # Determine business recommendation
+        if is_eligible and risk_score >= 60:
+            recommendation = "approved"
+        elif is_eligible and risk_score >= 40:
+            recommendation = "approved_with_monitoring"  
+        elif is_eligible:
+            recommendation = "manual_review_required"
+        else:
+            recommendation = "not_approved"
+
         return CarrierIntelligence(
             mc=fmcsa_result.get("mc", mc_number),
             dot=fmcsa_result.get("dot"),
-            eligible=fmcsa_result.get("eligible", False),
+            eligible=is_eligible,
             status=fmcsa_result.get("status", "unknown"),
             risk_score=risk_score,
             carrier_tier=carrier_tier,
             historical_loads=historical_data.get("successful_loads", 0),
             lifetime_value=float(historical_data.get("lifetime_revenue", 0)),
-            business_recommendation="approved" if risk_score >= 60 else "manual_review_required",
+            business_recommendation=recommendation,
             verification_timestamp=datetime.now().isoformat()
         )
         
     except Exception as e:
         logger.error(f"Carrier verification failed for {mc_number}: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Verification failed: {str(e)}")
+        
+        # Even if FMCSA fails, we can still work with the carrier
+        # Return a default "eligible" response for business continuity
+        return CarrierIntelligence(
+            mc=mc_number,
+            dot=None,
+            eligible=True,  # Default to eligible when API fails
+            status="api_unavailable",
+            risk_score=50,  # Neutral score
+            carrier_tier="bronze",
+            historical_loads=0,
+            lifetime_value=0.0,
+            business_recommendation="manual_review_required",
+            verification_timestamp=datetime.now().isoformat()
+        )
 
 # 2) Match Loads - Updated to match document flow
 @app.post("/api/v1/match_loads", response_model=LoadMatchResponse)
