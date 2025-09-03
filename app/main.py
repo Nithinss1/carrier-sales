@@ -298,17 +298,7 @@ def verify_carrier_enhanced(
         raise HTTPException(status_code=400, detail="mc is required (query or JSON body)")
 
     try:
-        # TEMPORARY: Use mock data instead of FMCSA API
-        # Comment this out and uncomment the real API call once FMCSA is working
-        fmcsa_result = {
-            "mc": mc,
-            "dot": f"DOT{mc[2:]}",  # Mock DOT number
-            "eligible": True,
-            "status": "authorized"
-        }
-        
-        # Real API call (commented out for testing):
-        # fmcsa_result = fmcsa.verify_mc(mc)
+        fmcsa_result = fmcsa.verify_mc(mc)
 
         risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc)
         carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(risk_score)
