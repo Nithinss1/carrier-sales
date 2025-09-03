@@ -4,11 +4,9 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Request
-from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from fastapi import Body
-from fastapi import Query
+from fastapi import Body, Query
 
 
 
@@ -286,28 +284,27 @@ def version():
 
 # 1) Verify Carrier
 @app.post("/api/v1/verify_carrier", response_model=CarrierIntelligence)
-def verify_carrier_enhanced(
+async def verify_carrier_enhanced(
+    request: Request,
     mc: Optional[str] = Query(None),
-    payload: Optional[dict] = None,
     x_api_key: Optional[str] = Header(None),
-    demo: Optional[str] = Query(None),  # <-- NEW
-    background_tasks: BackgroundTasks = None
+    demo: Optional[str] = Query(None),
 ):
     require_key(x_api_key)
 
-    # NEW: read mc from JSON body if not in query
-    if not mc and payload and isinstance(payload, dict):
-        mc = payload.get("mc")
+    # 1) accept mc from body if not in query
+    if not mc:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                mc = body.get("mc")
+        except Exception:
+            mc = mc  # ignore bad JSON
 
     if not mc:
         raise HTTPException(status_code=422, detail="mc is required")
-    
-    allowed = set(os.getenv("ALLOWED_MCS", "").split(","))
-    if mc in allowed:
-        fmcsa_result["eligible"] = True
-        fmcsa_result["status"] = "authorized"
 
-    # NEW: simple demo overrides
+    # 2) demo shortcuts
     if demo == "eligible":
         return CarrierIntelligence(
             mc=mc, dot="9999999", eligible=True, status="authorized",
@@ -323,27 +320,33 @@ def verify_carrier_enhanced(
             verification_timestamp=datetime.now().isoformat()
         )
 
-
     try:
+        # 3) call FMCSA
         fmcsa_result = fmcsa.verify_mc(mc)
 
+        # 4) allowlist override (if desired)
+        allowed = {
+            item.strip() for item in os.getenv("ALLOWED_MCS", "").split(",") if item.strip()
+        }
+        if mc in allowed:
+            fmcsa_result["eligible"] = True
+            fmcsa_result["status"] = "authorized"
+
+        # 5) business intelligence
         risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc)
         carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(risk_score)
-
         historical_data = CALL_METRICS["carrier_intelligence"].get(mc, {})
 
         CALL_METRICS["total_calls"] += 1
         if fmcsa_result.get("eligible", False):
             CALL_METRICS["qualified_carriers"] += 1
 
-        if mc not in CALL_METRICS["carrier_intelligence"]:
-            CALL_METRICS["carrier_intelligence"][mc] = {
-                "first_contact": datetime.now().isoformat(),
-                "total_calls": 0,
-                "successful_loads": 0,
-                "lifetime_value_score": risk_score
-            }
-
+        CALL_METRICS["carrier_intelligence"].setdefault(mc, {
+            "first_contact": datetime.now().isoformat(),
+            "total_calls": 0,
+            "successful_loads": 0,
+            "lifetime_value_score": risk_score
+        })
         CALL_METRICS["carrier_intelligence"][mc]["total_calls"] += 1
         CALL_METRICS["carrier_intelligence"][mc]["last_contact"] = datetime.now().isoformat()
 
@@ -356,11 +359,12 @@ def verify_carrier_enhanced(
             carrier_tier=carrier_tier,
             historical_loads=historical_data.get("successful_loads", 0),
             lifetime_value=historical_data.get("lifetime_value_score", risk_score),
-            business_recommendation="approved" if risk_score >= 60 else "manual_review_required"
+            business_recommendation="approved" if risk_score >= 60 else "manual_review_required",
+            verification_timestamp=datetime.now().isoformat()
         )
-
     except Exception as e:
         logger.error(f"Carrier verification failed for {mc}: {str(e)}")
+        # 502 is fine here since it’s often an upstream (FMCSA) failure
         raise HTTPException(status_code=502, detail=f"Verification failed: {str(e)}")
 
 # 2) Match Loads
