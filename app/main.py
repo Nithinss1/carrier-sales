@@ -283,57 +283,42 @@ def version():
 # 1) Verify Carrier
 @app.post("/api/v1/verify_carrier", response_model=CarrierIntelligence)
 def verify_carrier_enhanced(
-    mc: Optional[str] = None,
-    payload: Optional[dict] = Body(default=None),
+    mc: str,
     x_api_key: Optional[str] = Header(None),
     background_tasks: BackgroundTasks = None
 ):
     require_key(x_api_key)
-
-    # Allow mc from query OR body
-    mc = mc or (payload or {}).get("mc")
-    if not mc:
-        raise HTTPException(status_code=400, detail="mc is required (query or JSON body)")
-
     try:
-        fmcsa_result = fmcsa.verify_mc(mc)
-
-        risk_score = BusinessIntelligenceEngine.calculate_carrier_risk_score(fmcsa_result, mc)
-        carrier_tier = BusinessIntelligenceEngine.determine_carrier_tier(risk_score)
-
-        historical_data = CALL_METRICS["carrier_intelligence"].get(mc, {})
+        res = fmcsa.verify_mc(mc)
+        risk = BusinessIntelligenceEngine.calculate_carrier_risk_score(res, mc)
+        tier = BusinessIntelligenceEngine.determine_carrier_tier(risk)
+        hist = CALL_METRICS["carrier_intelligence"].get(mc, {})
 
         CALL_METRICS["total_calls"] += 1
-        if fmcsa_result.get("eligible", False):
+        if res.get("eligible"):
             CALL_METRICS["qualified_carriers"] += 1
 
         if mc not in CALL_METRICS["carrier_intelligence"]:
             CALL_METRICS["carrier_intelligence"][mc] = {
-                "first_contact": datetime.now().isoformat(),
-                "total_calls": 0,
-                "successful_loads": 0,
-                "lifetime_value_score": risk_score
+                "first_contact": datetime.utcnow().isoformat() + "Z",
+                "total_calls": 0, "successful_loads": 0,
+                "lifetime_value_score": risk
             }
-
         CALL_METRICS["carrier_intelligence"][mc]["total_calls"] += 1
-        CALL_METRICS["carrier_intelligence"][mc]["last_contact"] = datetime.now().isoformat()
+        CALL_METRICS["carrier_intelligence"][mc]["last_contact"] = datetime.utcnow().isoformat() + "Z"
 
-        return CarrierIntelligence(
-            mc=fmcsa_result["mc"],
-            dot=fmcsa_result.get("dot"),
-            eligible=fmcsa_result["eligible"],
-            status=fmcsa_result["status"],
-            risk_score=risk_score,
-            carrier_tier=carrier_tier,
-            historical_loads=historical_data.get("successful_loads", 0),
-            lifetime_value=historical_data.get("lifetime_value_score", risk_score),
-            business_recommendation="approved" if risk_score >= 60 else "manual_review_required"
+        payload = CarrierIntelligence(
+            mc=res["mc"], dot=res.get("dot"), eligible=res["eligible"], status=res["status"],
+            risk_score=risk, carrier_tier=tier,
+            historical_loads=hist.get("successful_loads", 0),
+            lifetime_value=hist.get("lifetime_value_score", risk),
+            business_recommendation="approved" if risk >= 60 else "manual_review_required"
         )
-
+        logger.info(f"Verified carrier {mc}: tier={tier}, risk={risk}")
+        return payload
     except Exception as e:
-        logger.error(f"Carrier verification failed for {mc}: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Verification failed: {str(e)}")
-
+        logger.exception("Carrier verification failed")
+        raise HTTPException(status_code=500, detail=f"Verification failed: {e}")
 
 # 2) Match Loads
 @app.post("/api/v1/match_loads", response_model=LoadMatchResponse)
