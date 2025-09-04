@@ -5,12 +5,27 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from time import time
+from threading import Lock
 
 # --- Boot ---
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
+
+SESSION: Dict[str, Dict[str, Any]] = {}
+SESSION_LOCK = Lock()
+
+def _get_session(cid: Optional[str]) -> Dict[str, Any]:
+    if not cid:
+        return {}
+    with SESSION_LOCK:
+        s = SESSION.get(cid)
+        if not s:
+            s = {"created": time()}
+            SESSION[cid] = s
+        return s
 
 # --- Models ---
 class WebhookPayload(BaseModel):
@@ -185,7 +200,8 @@ async def handle_carrier_call_webhook(
 ):
     require_key(x_api_key)
     try:
-        mc_number = extract_mc_number(payload.message or "", payload.data)
+        sess = _get_session(payload.caller_id)
+        mc_number = extract_mc_number(payload.message or "", payload.data) or sess.get("mc")
         if not mc_number:
             return make_result(
                 status="error",
@@ -196,6 +212,12 @@ async def handle_carrier_call_webhook(
 
         verification_request = MCVerificationRequest(mc=mc_number)
         carrier_intel = await verify_carrier_enhanced(verification_request, x_api_key)
+
+        # --- Store session info ---
+        if payload.caller_id:
+            sess["mc"] = mc_number
+            sess["carrier_tier"] = carrier_intel.carrier_tier
+            sess["risk_score"] = carrier_intel.risk_score
 
         if not carrier_intel.eligible:
             return make_result(
@@ -233,13 +255,21 @@ async def handle_carrier_call_webhook(
 @app.post("/api/v1/webhook/equipment_info")
 async def handle_equipment_info(
     payload: WebhookPayload,
-    mc_number: str,   # pass as query ?mc_number=XXXXXX
+    mc_number: str,
     x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ):
     require_key(x_api_key)
     try:
+        sess = _get_session(payload.caller_id)
         equipment_type = extract_equipment_type(payload.message or "")
         origin = extract_location(payload.message or "")
+
+        # --- Store session info ---
+        if payload.caller_id:
+            if equipment_type:
+                sess["equipment_type"] = equipment_type
+            if origin:
+                sess["origin"] = origin
 
         if not equipment_type:
             return make_result(
