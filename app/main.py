@@ -9,10 +9,10 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 
-API_KEY = os.getenv("SERVICE_API_KEY", "supersecret")
+API_KEY = os.getenv("API_KEY", "supersecret123")
 FMCSA_API_KEY = os.getenv("FMCSA_API_KEY")
 CARRIER_UPSTREAM_URL = os.getenv("CARRIER_UPSTREAM_URL", "").strip()
-CARRIER_UPSTREAM_HEADER = os.getenv("CARRIER_UPSTREAM_HEADER", "x-api-key")
+CARRIER_UPSTREAM_HEADER = os.getenv("CARRIER_UPSTREAM_HEADER", "API_KEY")
 CARRIER_UPSTREAM_KEY = os.getenv("CARRIER_UPSTREAM_KEY", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "data.db")
