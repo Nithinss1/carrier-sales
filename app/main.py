@@ -182,7 +182,7 @@ def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)
 
 @app.post("/evaluate_offer", response_model=EvaluateOut)
 def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None)):
-    if x_api_key != SERVICE_API_KEY:
+    if x_api_key != API_KEY:
         raise HTTPException(401, "Unauthorized")
 
     MAX_OVER_LISTED_PCT = 0.15
