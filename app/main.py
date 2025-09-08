@@ -188,54 +188,58 @@ def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)
     loads = [r[1] for r in results[: max(1, payload.max_results)]]
     return {"loads": loads}
 
-@app.post("/evaluate_offer", response_model=EvaluateOut)
+@app.post("/evaluate_offer")
 def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(401, "Unauthorized")
+    _require(x_api_key)
+    try:
+        # --- guardrails ---
+        MAX_OVER_LISTED_PCT = 0.15
+        MIN_STEP            = 50
+        CLOSE_GAP           = 50
+        SHORT_HAUL_BUMP     = 100 if (p.miles or 0) < 300 else 0
+        EQUIP_BUMP_MAP      = {"Reefer": 75, "Flatbed": 100}
+        equip_bump          = EQUIP_BUMP_MAP.get(p.equipment_type or "", 0)
+        round_bump          = max(0, p.round - 1) * 50
 
-    MAX_OVER_LISTED_PCT = 0.15
-    MIN_STEP  = 50
-    CLOSE_GAP = 50
-    SHORT_HAUL_BUMP = 100 if (p.miles or 0) < 300 else 0
-    EQUIP_BUMP_MAP  = {"Reefer": 75, "Flatbed": 100}
-    equip_bump      = EQUIP_BUMP_MAP.get(p.equipment_type or "", 0)
-    round_bump      = max(0, p.round - 1) * 50
+        base_cap = int(round(p.listed_rate * (1 + MAX_OVER_LISTED_PCT)))
+        cap_rate = base_cap + SHORT_HAUL_BUMP + equip_bump + round_bump
 
-    base_cap = int(round(p.listed_rate * (1 + MAX_OVER_LISTED_PCT)))
-    cap_rate = base_cap + SHORT_HAUL_BUMP + equip_bump + round_bump
+        # 1) If the carrier is <= your current offer → accept (you pay less).
+        if p.carrier_offer <= p.our_offer:
+            return {
+                "decision": "accept",
+                "next_offer": int(p.carrier_offer),
+                "round_next": p.round + 1,
+                "cap_rate": int(cap_rate),
+                "reason": "carrier at/below current offer"
+            }
 
-    # If carrier is at/below your offer, accept (you pay less).
-    if p.carrier_offer <= p.our_offer:
-        return EvaluateOut(
-            decision="accept",
-            next_offer=int(p.carrier_offer),
-            round_next=p.round + 1,
-            cap_rate=int(cap_rate),
-            rationale="carrier at/below current offer",
-        )
+        # 2) Carrier above your offer. If within cap and late/close → accept.
+        if p.carrier_offer <= cap_rate and (p.round >= 3 or (p.carrier_offer - p.our_offer) <= CLOSE_GAP):
+            return {
+                "decision": "accept",
+                "next_offer": int(p.carrier_offer),
+                "round_next": p.round + 1,
+                "cap_rate": int(cap_rate),
+                "reason": "within cap and close/late round"
+            }
 
-    # Carrier above your offer: accept if within cap and late/close.
-    if p.carrier_offer <= cap_rate and (p.round >= 3 or (p.carrier_offer - p.our_offer) <= CLOSE_GAP):
-        return EvaluateOut(
-            decision="accept",
-            next_offer=int(p.carrier_offer),
-            round_next=p.round + 1,
-            cap_rate=int(cap_rate),
-            rationale="within cap and close/late round",
-        )
+        # 3) Otherwise counter upward toward them, but never above cap.
+        gap        = p.carrier_offer - p.our_offer
+        step       = max(MIN_STEP, int(math.ceil(0.5 * gap)))  # ~split the diff
+        next_offer = min(cap_rate, p.our_offer + step)
 
-    # Otherwise, counter upward toward them but never above cap.
-    gap        = p.carrier_offer - p.our_offer
-    step       = max(MIN_STEP, int(math.ceil(0.5 * gap)))  # ~split difference
-    next_offer = min(cap_rate, p.our_offer + step)
+        return {
+            "decision": "counter",
+            "next_offer": int(next_offer),
+            "round_next": p.round + 1,
+            "cap_rate": int(cap_rate),
+            "reason": "counter under cap"
+        }
 
-    return EvaluateOut(
-        decision="counter",
-        next_offer=int(next_offer),
-        round_next=p.round + 1,
-        cap_rate=int(cap_rate),
-        rationale="counter under cap",
-    )
+    except Exception as e:
+        # Return error details so you don't have to dig logs during setup
+        return {"error": "negotiation_error", "detail": str(e), "trace": traceback.format_exc()}
 
 @app.post("/classify_and_log")
 def classify_and_log(p: LogPayload, x_api_key: Optional[str] = Header(None)):
