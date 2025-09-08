@@ -1,9 +1,9 @@
 
-import os
+import os, math
 import json
 import sqlite3
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -22,6 +22,23 @@ app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
 class VerifyPayload(BaseModel):
     mc: str
     caller_number: Optional[str] = None
+
+class EvaluateIn(BaseModel):
+    load_id: str
+    listed_rate: int          # board rate (your starting anchor)
+    our_offer: int            # what you last quoted to the carrier
+    carrier_offer: int        # what the carrier is asking now
+    miles: Optional[int] = 0
+    equipment_type: Optional[str] = "Dry Van"
+    round: int                # 1..3
+
+class EvaluateOut(BaseModel):
+    decision: Literal["accept", "counter"]
+    next_offer: int           # accept at this price, or your new counter
+    cap_rate: int             # max you’ll pay this call
+    floor_rate: int           # just informational (not used here)
+    round_next: int           # pass this back on the next call
+    reason: str
 
 class SearchPayload(BaseModel):
     origin: Optional[str] = None
@@ -163,19 +180,54 @@ def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)
     loads = [r[1] for r in results[: max(1, payload.max_results)]]
     return {"loads": loads}
 
-@app.post("/evaluate_offer")
-def evaluate_offer(p: EvaluatePayload, x_api_key: Optional[str] = Header(None)):
-    auth(x_api_key)
-    listed = float(p.listed_rate); offer = float(p.carrier_offer); rnd = int(p.round)
-    tier_floor_factor = {"gold": 0.93, "silver": 0.9, "standard": 0.88, "bronze": 0.87}.get((p.tier or "standard").lower(), 0.88)
-    abs_floor = listed * tier_floor_factor
-    if rnd >= 3 and offer >= abs_floor:
-        return {"decision": "accept", "next_offer": offer, "rationale": "final round within floor"}
-    if offer >= abs_floor and offer >= listed * 0.9:
-        return {"decision": "accept", "next_offer": offer, "rationale": "meets policy floor"}
-    counter = min(listed - 50, (offer + listed) / 2)
-    if counter < abs_floor: counter = abs_floor
-    return {"decision":"counter","next_offer":round(counter,2),"rationale":f"split diff; floor={round(abs_floor,2)}"}
+@app.post("/evaluate_offer", response_model=EvaluateOut)
+def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None)):
+    if x_api_key != SERVICE_API_KEY:
+        raise HTTPException(401, "Unauthorized")
+
+    MAX_OVER_LISTED_PCT = 0.15
+    MIN_STEP  = 50
+    CLOSE_GAP = 50
+    SHORT_HAUL_BUMP = 100 if (p.miles or 0) < 300 else 0
+    EQUIP_BUMP_MAP  = {"Reefer": 75, "Flatbed": 100}
+    equip_bump      = EQUIP_BUMP_MAP.get(p.equipment_type or "", 0)
+    round_bump      = max(0, p.round - 1) * 50
+
+    base_cap = int(round(p.listed_rate * (1 + MAX_OVER_LISTED_PCT)))
+    cap_rate = base_cap + SHORT_HAUL_BUMP + equip_bump + round_bump
+
+    # If carrier is at/below your offer, accept (you pay less).
+    if p.carrier_offer <= p.our_offer:
+        return EvaluateOut(
+            decision="accept",
+            next_offer=int(p.carrier_offer),
+            round_next=p.round + 1,
+            cap_rate=int(cap_rate),
+            rationale="carrier at/below current offer",
+        )
+
+    # Carrier above your offer: accept if within cap and late/close.
+    if p.carrier_offer <= cap_rate and (p.round >= 3 or (p.carrier_offer - p.our_offer) <= CLOSE_GAP):
+        return EvaluateOut(
+            decision="accept",
+            next_offer=int(p.carrier_offer),
+            round_next=p.round + 1,
+            cap_rate=int(cap_rate),
+            rationale="within cap and close/late round",
+        )
+
+    # Otherwise, counter upward toward them but never above cap.
+    gap        = p.carrier_offer - p.our_offer
+    step       = max(MIN_STEP, int(math.ceil(0.5 * gap)))  # ~split difference
+    next_offer = min(cap_rate, p.our_offer + step)
+
+    return EvaluateOut(
+        decision="counter",
+        next_offer=int(next_offer),
+        round_next=p.round + 1,
+        cap_rate=int(cap_rate),
+        rationale="counter under cap",
+    )
 
 @app.post("/classify_and_log")
 def classify_and_log(p: LogPayload, x_api_key: Optional[str] = Header(None)):
