@@ -18,6 +18,9 @@ CARRIER_UPSTREAM_KEY = os.getenv("CARRIER_UPSTREAM_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
 app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
+def _require(x_api_key: str | None):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "Unauthorized")
 
 class VerifyPayload(BaseModel):
     mc: str
@@ -117,8 +120,13 @@ def _round25(x: float) -> int:
     return int(round(x / 25.0) * 25)
 
 @app.get("/healthz")
-def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+def healthz():
+    return {"ok": True, "version": "evaluate-v2"}
+
+@app.post("/debug_echo")
+def debug_echo(p: dict, x_api_key: str = Header(None)):
+    _require(x_api_key)
+    return {"received": p}
 
 @app.post("/verify_carrier")
 async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Header(None)):
