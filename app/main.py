@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import httpx
 
 from .telemetry import (
+    router as telemetry_router,
     start_session, log_verify_result, log_loads_pitched,
     log_negotiation_round, log_outcome, log_sentiment
 )
