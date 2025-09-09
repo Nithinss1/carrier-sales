@@ -1,4 +1,3 @@
-
 import os, math
 import json
 import sqlite3
@@ -8,18 +7,22 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
-from .logging import router as logging_router
+
+from .telemetry import router as telemetry_router
+
 
 API_KEY = os.getenv("API_KEY", "supersecret123")
 FMCSA_API_KEY = os.getenv("FMCSA_API_KEY")
 CARRIER_UPSTREAM_URL = os.getenv("CARRIER_UPSTREAM_URL", "").strip()
 CARRIER_UPSTREAM_HEADER = os.getenv("CARRIER_UPSTREAM_HEADER", "API_KEY")
 CARRIER_UPSTREAM_KEY = os.getenv("CARRIER_UPSTREAM_KEY", "").strip()
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "../data.db"))
 
-DB_PATH = os.getenv("DB_PATH", "data.db")
-
+# app is already instantiated above; include other routers as needed
+# app.include_router(logging_router)
 app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
-app.include_router(logging_router)
+app.include_router(telemetry_router)
+
 
 def _require(x_api_key: str | None):
     if x_api_key != API_KEY:
