@@ -1,114 +1,57 @@
-from uuid import uuid4
-from datetime import datetime
-from typing import Any, Dict, Optional, Literal
-from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import create_engine, text
-import os, json
+# app/telemetry.py
+from fastapi import APIRouter, Body
+import time, uuid
+from typing import Any, Dict, List
 
-router = APIRouter()
+# In-memory store (swap for DB later)
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+EVENTS: Dict[str, List[Dict[str, Any]]] = {}
 
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+# ---- Local helpers you can call from your code ----
+def start_session(caller=None, session_id: str | None=None) -> str:
+    sid = session_id or str(uuid.uuid4())
+    SESSIONS[sid] = {"session_id": sid, "started_at": time.time(), "caller": caller}
+    EVENTS.setdefault(sid, [])
+    return sid
 
-# --- very small schema (2 tables) ---
-with engine.begin() as cx:
-    cx.execute(text("""
-    CREATE TABLE IF NOT EXISTS sessions(
-      session_id TEXT PRIMARY KEY,
-      created_at TEXT,
-      mc TEXT,
-      eligible INTEGER,
-      tier TEXT,
-      outcome TEXT,
-      sentiment TEXT,
-      final_rate INTEGER,
-      listed_rate INTEGER,
-      miles INTEGER,
-      load_id TEXT,
-      origin TEXT,
-      destination TEXT,
-      equipment_type TEXT,
-      rounds INTEGER DEFAULT 0
-    )"""))
-    cx.execute(text("""
-    CREATE TABLE IF NOT EXISTS events(
-      id TEXT PRIMARY KEY,
-      session_id TEXT,
-      ts TEXT,
-      event_type TEXT,
-      payload TEXT
-    )"""))
+def end_session(session_id: str, summary: Dict[str, Any] | None=None):
+    SESSIONS.setdefault(session_id, {})["ended_at"] = time.time()
+    if summary: SESSIONS[session_id]["summary"] = summary
 
-class StartSessionIn(BaseModel):
-    call_id: Optional[str] = None
-    mc: Optional[str] = None
+def log_event(session_id: str, event_type: str, data: Dict[str, Any]):
+    EVENTS.setdefault(session_id, []).append({"ts": time.time(), "type": event_type, "data": data})
 
-class StartSessionOut(BaseModel):
-    session_id: str
+def log_verify_result(sid, mc, status, eligible, tier, risk_score):
+    log_event(sid, "verify_result", {"mc": mc, "status": status, "eligible": eligible, "carrier_tier": tier, "risk_score": risk_score})
 
-@router.post("/session/start", response_model=StartSessionOut)
-def start_session(body: StartSessionIn):
-    sid = body.call_id or str(uuid4())
-    now = datetime.utcnow().isoformat()
-    with engine.begin() as cx:
-        cx.execute(text("INSERT OR IGNORE INTO sessions(session_id, created_at, mc) VALUES (:sid, :now, :mc)"),
-                   {"sid": sid, "now": now, "mc": body.mc})
-    return StartSessionOut(session_id=sid)
+def log_loads_pitched(sid, loads): log_event(sid, "loads_pitched", {"loads": loads})
+def log_negotiation_round(sid, round_num, load_id, listed_rate, our_offer, carrier_offer, decision, next_offer, cap_rate):
+    log_event(sid, "negotiation_round", {
+        "round": round_num, "load_id": load_id, "listed_rate": listed_rate,
+        "our_offer": our_offer, "carrier_offer": carrier_offer,
+        "decision": decision, "next_offer": next_offer, "cap_rate": cap_rate
+    })
+def log_outcome(sid, outcome, final_rate=None, load_id=None): log_event(sid, "outcome", {"outcome": outcome, "final_rate": final_rate, "load_id": load_id})
+def log_sentiment(sid, label, score=None): log_event(sid, "sentiment", {"label": label, "score": score})
 
-class LogEventIn(BaseModel):
-    session_id: str
-    event_type: Literal[
-        "verify_result","loads_pitched","negotiation_round","outcome","sentiment"
-    ]
-    payload: Dict[str, Any] = Field(default_factory=dict)
+# ---- Optional API for external dashboards ----
+router = APIRouter(prefix="/log", tags=["telemetry"])
 
-@router.post("/events")
-def log_event(ev: LogEventIn):
-    now = datetime.utcnow().isoformat()
-    with engine.begin() as cx:
-        cx.execute(text("INSERT INTO events(id, session_id, ts, event_type, payload) VALUES (:id,:sid,:ts,:t,:p)"),
-                   {"id": str(uuid4()), "sid": ev.session_id, "ts": now, "t": ev.event_type, "p": json.dumps(ev.payload)})
-        # light denormalization for dashboard speed
-        if ev.event_type == "verify_result":
-            cx.execute(text("""UPDATE sessions SET eligible=:e, tier=:tier WHERE session_id=:sid"""),
-                       {"e": 1 if ev.payload.get("eligible") else 0, "tier": ev.payload.get("tier"), "sid": ev.session_id})
-        if ev.event_type == "loads_pitched":
-            pl = ev.payload
-            cx.execute(text("""UPDATE sessions SET load_id=:lid, listed_rate=:rate, miles=:mi,
-                               origin=:o, destination=:d, equipment_type=:eq WHERE session_id=:sid"""),
-                       {"lid": pl.get("load_id"), "rate": pl.get("loadboard_rate"),
-                        "mi": pl.get("miles"), "o": pl.get("origin"), "d": pl.get("destination"),
-                        "eq": pl.get("equipment_type"), "sid": ev.session_id})
-        if ev.event_type == "negotiation_round":
-            cx.execute(text("""UPDATE sessions SET rounds=COALESCE(rounds,0)+1,
-                               final_rate=:fr WHERE session_id=:sid"""),
-                       {"fr": ev.payload.get("next_offer") or ev.payload.get("carrier_offer"), "sid": ev.session_id})
-        if ev.event_type == "outcome":
-            cx.execute(text("""UPDATE sessions SET outcome=:o, final_rate=:r WHERE session_id=:sid"""),
-                       {"o": ev.payload.get("outcome"), "r": ev.payload.get("final_rate"), "sid": ev.session_id})
-        if ev.event_type == "sentiment":
-            cx.execute(text("""UPDATE sessions SET sentiment=:s WHERE session_id=:sid"""),
-                       {"s": ev.payload.get("label"), "sid": ev.session_id})
+@router.post("/session/start")
+def session_start_api(body: Dict[str, Any] = Body(...)):
+    sid = start_session(caller=body.get("caller"), session_id=body.get("session_id"))
+    return {"session_id": sid}
+
+@router.post("/session/end")
+def session_end_api(body: Dict[str, Any] = Body(...)):
+    end_session(body["session_id"], summary=body.get("summary"))
     return {"ok": True}
 
-@router.get("/dashboard/summary")
-def dashboard_summary():
-    with engine.begin() as cx:
-        totals = cx.execute(text("SELECT COUNT(*) FROM sessions")).scalar() or 0
-        acc   = cx.execute(text("SELECT COUNT(*) FROM sessions WHERE outcome='accept'")).scalar() or 0
-        rounds= cx.execute(text("SELECT ROUND(AVG(COALESCE(rounds,0)),2) FROM sessions")).scalar() or 0
-        rpm   = cx.execute(text("""
-            SELECT ROUND(AVG(CASE WHEN miles>0 THEN CAST(final_rate AS FLOAT)/miles END),2) FROM sessions
-        """)).scalar()
-        top_lanes = cx.execute(text("""
-            SELECT origin||' → '||destination AS lane, COUNT(*) c
-            FROM sessions GROUP BY lane ORDER BY c DESC LIMIT 5
-        """)).mappings().all()
-    return {
-        "total_calls": totals,
-        "accept_rate": (acc / totals) if totals else 0.0,
-        "avg_rounds": rounds,
-        "avg_rate_per_mile": rpm or 0,
-        "top_lanes": list(top_lanes),
-    }
+@router.post("/events")
+def events_api(body: Dict[str, Any] = Body(...)):
+    log_event(body["session_id"], body.get("event_type","event"), body.get("data", {}))
+    return {"ok": True}
+
+@router.get("/events/{session_id}")
+def get_events(session_id: str):
+    return {"session": SESSIONS.get(session_id), "events": EVENTS.get(session_id, [])}
