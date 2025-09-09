@@ -321,25 +321,19 @@ def metrics():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return HTMLResponse("""
-    <!doctype html><html><head><meta charset='utf-8'>
-    <title>Inbound Carrier Sales Dashboard</title>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
-    <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
-    <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}.card{padding:16px;border:1px solid #eee;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}h1{margin:0 0 12px 0}</style>
-    </head><body><h1>Inbound Carrier Sales — KPIs</h1>
-    <div class='grid'><div class='card'><canvas id='outcome'></canvas></div>
-    <div class='card'><canvas id='sentiment'></canvas></div>
-    <div class='card'><canvas id='rounds'></canvas></div>
-    <div class='card'><canvas id='delta'></canvas></div></div>
-    <script>
-    async function load(){const r=await fetch('/metrics');const m=await r.json();
-      const outcomes=Object.keys(m.by_outcome||{});const oc=outcomes.map(k=>m.by_outcome[k]);
-      const sentiments=Object.keys(m.sentiments||{});const sc=sentiments.map(k=>m.sentiments[k]);
-      new Chart(document.getElementById('outcome'),{type:'bar',data:{labels:outcomes,datasets:[{label:'Calls',data:oc}]}})
-      new Chart(document.getElementById('sentiment'),{type:'bar',data:{labels:sentiments,datasets:[{label:'Count',data:sc}]}})
-      new Chart(document.getElementById('rounds'),{type:'bar',data:{labels:['Avg Rounds'],datasets:[{label:'Rounds',data:[m.rounds_avg]}]}})
-      new Chart(document.getElementById('delta'),{type:'bar',data:{labels:['Avg $ Delta (final - listed)'],datasets:[{label:'Delta',data:[m.delta_avg]}]}})
-    } load();
-    </script></body></html>
-    """ )
+    return """
+    <html><body>
+      <h2>Inbound Carrier Sales – Dashboard</h2>
+      <pre id="sum">Loading summary…</pre>
+      <pre id="rec">Loading recent…</pre>
+      <script>
+       async function go(){
+         const s = await (await fetch('/log/summary')).json();
+         const r = await (await fetch('/log/recent?limit=10')).json();
+         document.getElementById('sum').textContent = JSON.stringify(s, null, 2);
+         document.getElementById('rec').textContent = JSON.stringify(r, null, 2);
+       }
+       go();
+      </script>
+    </body></html>
+    """
