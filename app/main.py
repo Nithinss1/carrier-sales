@@ -1,3 +1,4 @@
+
 import os, math
 import json
 import sqlite3
@@ -8,7 +9,10 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 
-from .telemetry import router as telemetry_router
+from .telemetry import (
+    start_session, log_verify_result, log_loads_pitched,
+    log_negotiation_round, log_outcome, log_sentiment
+)
 
 
 API_KEY = os.getenv("API_KEY", "supersecret123")
@@ -17,9 +21,7 @@ CARRIER_UPSTREAM_URL = os.getenv("CARRIER_UPSTREAM_URL", "").strip()
 CARRIER_UPSTREAM_HEADER = os.getenv("CARRIER_UPSTREAM_HEADER", "API_KEY")
 CARRIER_UPSTREAM_KEY = os.getenv("CARRIER_UPSTREAM_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "../data.db"))
-
-# app is already instantiated above; include other routers as needed
-# app.include_router(logging_router)
+from .telemetry import router as telemetry_router
 app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
 app.include_router(telemetry_router)
 
@@ -31,6 +33,7 @@ def _require(x_api_key: str | None):
 class VerifyPayload(BaseModel):
     mc: str
     caller_number: Optional[str] = None
+    session_id: Optional[str] = None
 
 class EvaluateIn(BaseModel):
     load_id: str
@@ -40,6 +43,7 @@ class EvaluateIn(BaseModel):
     miles: Optional[int] = 0
     equipment_type: Optional[str] = "Dry Van"
     round: int                # 1..3
+    session_id: Optional[str] = None
 
 class EvaluateOut(BaseModel):
     decision: Literal["accept", "counter"]
@@ -56,6 +60,7 @@ class SearchPayload(BaseModel):
     pickup_end: Optional[str] = None
     equipment_type: Optional[str] = None
     max_results: int = 3
+    session_id: Optional[str] = None
 
 class EvaluatePayload(BaseModel):
     load_id: str
@@ -135,8 +140,9 @@ def debug_echo(p: dict, x_api_key: str = Header(None)):
     return {"received": p}
 
 @app.post("/verify_carrier")
-async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Header(None)):
+async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Header(None), x_session_id: Optional[str] = Header(None)):
     auth(x_api_key)
+    sid = payload.session_id or x_session_id or start_session(caller="inbound_voice")
     mc = "".join([c for c in payload.mc if c.isdigit()])
     if not mc:
         raise HTTPException(400, "Missing MC")
@@ -147,7 +153,7 @@ async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Head
                 r = await client.post(CARRIER_UPSTREAM_URL, params={"mc": mc}, headers=headers)
                 r.raise_for_status()
                 u = r.json()
-                return {
+                result = {
                     "mc": mc,
                     "dot": u.get("dot"),
                     "eligible": bool(u.get("eligible", False)),
@@ -157,11 +163,17 @@ async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Head
                     "business_recommendation": u.get("business_recommendation", "manual_review_required"),
                     "verification_timestamp": datetime.utcnow().isoformat() + "Z"
                 }
+                log_verify_result(
+                    sid, mc, result.get("status"), result.get("eligible"),
+                    result.get("carrier_tier"), result.get("risk_score")
+                )
+                result["session_id"] = sid
+                return result
             except Exception:
                 pass
     ineligible = {"000111", "999999", "123"}
     eligible = mc not in ineligible
-    return {
+    result = {
         "mc": mc,
         "dot": None,
         "eligible": eligible,
@@ -171,10 +183,17 @@ async def verify_carrier(payload: VerifyPayload, x_api_key: Optional[str] = Head
         "business_recommendation": "ok_to_proceed" if eligible else "manual_review_required",
         "verification_timestamp": datetime.utcnow().isoformat() + "Z"
     }
+    log_verify_result(
+        sid, mc, result.get("status"), result.get("eligible"),
+        result.get("carrier_tier"), result.get("risk_score")
+    )
+    result["session_id"] = sid
+    return result
 
 @app.post("/search_loads")
-def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)):
+def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None), x_session_id: Optional[str] = Header(None)):
     auth(x_api_key)
+    sid = payload.session_id or x_session_id or start_session()
     o = normalize(payload.origin)
     d = normalize(payload.destination)
     et = normalize(payload.equipment_type)
@@ -192,11 +211,13 @@ def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)
         if score > 0: results.append((score, L))
     results.sort(key=lambda x: x[0], reverse=True)
     loads = [r[1] for r in results[: max(1, payload.max_results)]]
-    return {"loads": loads}
+    log_loads_pitched(sid, loads)
+    return {"session_id": sid, "loads": loads}
 
 @app.post("/evaluate_offer")
-def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None)):
+def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None), x_session_id: Optional[str] = Header(None)):
     _require(x_api_key)
+    sid = p.session_id or x_session_id or start_session()
     try:
         # --- guardrails ---
         MAX_OVER_LISTED_PCT = 0.15
@@ -212,36 +233,57 @@ def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None)):
 
         # 1) If the carrier is <= your current offer → accept (you pay less).
         if p.carrier_offer <= p.our_offer:
-            return {
+            resp = {
                 "decision": "accept",
                 "next_offer": int(p.carrier_offer),
                 "round_next": p.round + 1,
                 "cap_rate": int(cap_rate),
                 "reason": "carrier at/below current offer"
             }
+            log_negotiation_round(
+                sid, p.round, p.load_id, p.listed_rate,
+                p.our_offer, p.carrier_offer,
+                resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
+            )
+            resp["session_id"] = sid
+            return resp
 
         # 2) Carrier above your offer. If within cap and late/close → accept.
         if p.carrier_offer <= cap_rate and (p.round >= 3 or (p.carrier_offer - p.our_offer) <= CLOSE_GAP):
-            return {
+            resp = {
                 "decision": "accept",
                 "next_offer": int(p.carrier_offer),
                 "round_next": p.round + 1,
                 "cap_rate": int(cap_rate),
                 "reason": "within cap and close/late round"
             }
+            log_negotiation_round(
+                sid, p.round, p.load_id, p.listed_rate,
+                p.our_offer, p.carrier_offer,
+                resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
+            )
+            resp["session_id"] = sid
+            return resp
 
         # 3) Otherwise counter upward toward them, but never above cap.
         gap        = p.carrier_offer - p.our_offer
         step       = max(MIN_STEP, int(math.ceil(0.5 * gap)))  # ~split the diff
         next_offer = min(cap_rate, p.our_offer + step)
 
-        return {
+        resp = {
             "decision": "counter",
             "next_offer": int(next_offer),
             "round_next": p.round + 1,
             "cap_rate": int(cap_rate),
             "reason": "counter under cap"
         }
+        log_negotiation_round(
+            sid, p.round, p.load_id, p.listed_rate,
+            p.our_offer, p.carrier_offer,
+            resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
+        )
+        resp["session_id"] = sid
+        return resp
 
     except Exception as e:
         # Return error details so you don't have to dig logs during setup
