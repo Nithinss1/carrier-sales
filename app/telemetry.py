@@ -2,6 +2,8 @@
 from fastapi import APIRouter, Body
 import time, uuid
 from typing import Any, Dict, List
+from statistics import mean
+
 
 # In-memory store (swap for DB later)
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -55,3 +57,90 @@ def events_api(body: Dict[str, Any] = Body(...)):
 @router.get("/events/{session_id}")
 def get_events(session_id: str):
     return {"session": SESSIONS.get(session_id), "events": EVENTS.get(session_id, [])}
+
+
+def _events_of(sid, t): 
+    return [e for e in EVENTS.get(sid, []) if e["type"] == t]
+def _latest_of(sid, t):
+    evs = _events_of(sid, t)
+    return evs[-1] if evs else None
+
+@router.get("/summary")
+def log_summary():
+    total_sessions = len(SESSIONS)
+    outcome_counts = {"accept":0, "decline":0, "callback":0, "counter":0, "info_only":0}
+    sentiment_counts = {"positive":0, "neutral":0, "negative":0}
+    rounds_per_session = []
+    deltas_abs = []   # final_rate - listed_rate
+    deltas_pct = []   # above/below list in %
+
+    for sid in SESSIONS.keys():
+        # rounds
+        rounds = len(_events_of(sid, "negotiation_round"))
+        rounds_per_session.append(rounds)
+
+        # outcome
+        o = _latest_of(sid, "outcome")
+        if o:
+            outcome = (o["data"].get("outcome") or "").lower()
+            if outcome in outcome_counts:
+                outcome_counts[outcome] += 1
+
+        # sentiment
+        s = _latest_of(sid, "sentiment")
+        if s:
+            label = (s["data"].get("label") or "").lower()
+            if label in sentiment_counts:
+                sentiment_counts[label] += 1
+
+        # rate deltas (if we have both)
+        lp = _latest_of(sid, "loads_pitched")
+        fr = o and o["data"].get("final_rate")
+        if lp and fr is not None:
+            try:
+                listed = int(lp["data"]["loads"][0]["loadboard_rate"])
+                final  = int(fr)
+                deltas_abs.append(final - listed)
+                if listed:
+                    deltas_pct.append((final - listed)/listed)
+            except Exception:
+                pass
+
+    accept = outcome_counts["accept"]
+    acc_rate = (accept / total_sessions) if total_sessions else 0.0
+
+    return {
+        "totals": {
+            "sessions": total_sessions,
+            "accept_rate": round(acc_rate, 3),
+            "avg_rounds": round(mean(rounds_per_session), 2) if rounds_per_session else 0
+        },
+        "mix": {
+            "outcomes": outcome_counts,
+            "sentiment": sentiment_counts
+        },
+        "pricing": {
+            "avg_delta_abs": round(mean(deltas_abs), 2) if deltas_abs else 0,
+            "avg_delta_pct": round(mean(deltas_pct), 3) if deltas_pct else 0
+        }
+    }
+
+@router.get("/recent")
+def log_recent(limit: int = 10):
+    # last N sessions with key facts
+    rows = []
+    for sid, sess in list(SESSIONS.items())[-limit:]:
+        lp = _latest_of(sid, "loads_pitched")
+        o  = _latest_of(sid, "outcome")
+        s  = _latest_of(sid, "sentiment")
+        rows.append({
+            "session_id": sid,
+            "started_at": sess.get("started_at"),
+            "outcome": (o and o["data"].get("outcome")) or None,
+            "final_rate": (o and o["data"].get("final_rate")) or None,
+            "listed_rate": (lp and lp["data"]["loads"][0].get("loadboard_rate")) if lp else None,
+            "lane": (lp and f'{lp["data"]["loads"][0].get("origin")} → {lp["data"]["loads"][0].get("destination")}') if lp else None,
+            "sentiment": (s and s["data"].get("label")) or None,
+            "rounds": len(_events_of(sid, "negotiation_round")),
+        })
+    return {"items": rows[::-1]}
