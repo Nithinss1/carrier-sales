@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
+from .logging import router as logging_router
 
 API_KEY = os.getenv("API_KEY", "supersecret123")
 FMCSA_API_KEY = os.getenv("FMCSA_API_KEY")
@@ -18,6 +19,8 @@ CARRIER_UPSTREAM_KEY = os.getenv("CARRIER_UPSTREAM_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
 app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
+app.include_router(logging_router)
+
 def _require(x_api_key: str | None):
     if x_api_key != API_KEY:
         raise HTTPException(401, "Unauthorized")
