@@ -20,6 +20,28 @@ conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 # Add new columns for session summary and ended_at if not present
+
+def _cols(table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+def _ensure_schema():
+    sess_cols = _cols("sessions")
+    for col, ddl in [
+        ("ended_at",  "ALTER TABLE sessions ADD COLUMN ended_at REAL"),
+        ("caller",    "ALTER TABLE sessions ADD COLUMN caller TEXT"),
+        ("outcome",   "ALTER TABLE sessions ADD COLUMN outcome TEXT"),
+        ("final_rate","ALTER TABLE sessions ADD COLUMN final_rate REAL"),
+        ("load_id",   "ALTER TABLE sessions ADD COLUMN load_id TEXT"),
+    ]:
+        if col not in sess_cols:
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # ignore if already added elsewhere
+    conn.commit()
+
+_ensure_schema()
+
 conn.execute("""
 CREATE TABLE IF NOT EXISTS sessions(
   session_id TEXT PRIMARY KEY,
