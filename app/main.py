@@ -131,6 +131,18 @@ def parse_iso(ts: Optional[str]):
 def _round25(x: float) -> int:
     return int(round(x / 25.0) * 25)
 
+def round_to_25(x: float) -> int:
+    # always round to the nearest 25
+    return int(round(x / 25.0) * 25)
+
+def compute_cap(listed_rate: int, miles: int | None, equipment_type: str | None) -> int:
+    # Stable cap: depends only on load facts (not round or carrier ask)
+    base = min(325, int(0.25 * listed_rate))
+    equip_add = 75 if (equipment_type or "").lower() in ("reefer", "flatbed") else 0
+    shorthaul_add = 50 if (miles is not None and miles < 300) else 0
+    cap = listed_rate + base + equip_add + shorthaul_add
+    return round_to_25(cap)
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "version": "evaluate-v2"}
@@ -219,76 +231,67 @@ def search_loads(payload: SearchPayload, x_api_key: Optional[str] = Header(None)
 def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None), x_session_id: Optional[str] = Header(None)):
     _require(x_api_key)
     sid = p.session_id or x_session_id or start_session()
-    try:
-        # --- guardrails ---
-        MAX_OVER_LISTED_PCT = 0.15
-        MIN_STEP            = 50
-        CLOSE_GAP           = 50
-        SHORT_HAUL_BUMP     = 100 if (p.miles or 0) < 300 else 0
-        EQUIP_BUMP_MAP      = {"Reefer": 75, "Flatbed": 100}
-        equip_bump          = EQUIP_BUMP_MAP.get(p.equipment_type or "", 0)
-        round_bump          = max(0, p.round - 1) * 50
 
-        base_cap = int(round(p.listed_rate * (1 + MAX_OVER_LISTED_PCT)))
-        cap_rate = base_cap + SHORT_HAUL_BUMP + equip_bump + round_bump
+    listed = int(p.listed_rate)
+    prev   = int(p.our_offer)           # ← IMPORTANT: pass last next_offer here!
+    ask    = int(p.carrier_offer)
+    miles  = p.miles
+    equip  = p.equipment_type or ""
+    rnd    = int(p.round)
 
-        # 1) If the carrier is <= your current offer → accept (you pay less).
-        if p.carrier_offer <= p.our_offer:
-            resp = {
-                "decision": "accept",
-                "next_offer": int(p.carrier_offer),
-                "round_next": p.round + 1,
-                "cap_rate": int(cap_rate),
-                "reason": "carrier at/below current offer"
-            }
-            log_negotiation_round(
-                sid, p.round, p.load_id, p.listed_rate,
-                p.our_offer, p.carrier_offer,
-                resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
-            )
-            resp["session_id"] = sid
-            return resp
+    cap = compute_cap(listed, miles, equip)  # ← STABLE per load/session
 
-        # 2) Carrier above your offer. If within cap and late/close → accept.
-        if p.carrier_offer <= cap_rate and (p.round >= 3 or (p.carrier_offer - p.our_offer) <= CLOSE_GAP):
-            resp = {
-                "decision": "accept",
-                "next_offer": int(p.carrier_offer),
-                "round_next": p.round + 1,
-                "cap_rate": int(cap_rate),
-                "reason": "within cap and close/late round"
-            }
-            log_negotiation_round(
-                sid, p.round, p.load_id, p.listed_rate,
-                p.our_offer, p.carrier_offer,
-                resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
-            )
-            resp["session_id"] = sid
-            return resp
-
-        # 3) Otherwise counter upward toward them, but never above cap.
-        gap        = p.carrier_offer - p.our_offer
-        step       = max(MIN_STEP, int(math.ceil(0.5 * gap)))  # ~split the diff
-        next_offer = min(cap_rate, p.our_offer + step)
-
+    # If carrier is already at/below our current price, or very close late in the game, accept.
+    if ask <= cap and (ask <= prev or (rnd >= 3 and (ask - prev) <= 50)):
         resp = {
-            "decision": "counter",
-            "next_offer": int(next_offer),
-            "round_next": p.round + 1,
-            "cap_rate": int(cap_rate),
-            "reason": "counter under cap"
+            "decision": "accept",
+            "next_offer": ask,
+            "round_next": rnd + 1,
+            "cap_rate": cap,
+            "reason": "carrier within cap and close enough",
+            "session_id": sid
         }
         log_negotiation_round(
-            sid, p.round, p.load_id, p.listed_rate,
-            p.our_offer, p.carrier_offer,
+            sid, rnd, p.load_id, listed,
+            prev, ask,
             resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
         )
-        resp["session_id"] = sid
         return resp
 
-    except Exception as e:
-        # Return error details so you don't have to dig logs during setup
-        return {"error": "negotiation_error", "detail": str(e), "trace": traceback.format_exc()}
+    # Otherwise counter toward the smaller of (carrier ask, cap)
+    target = min(cap, ask)
+    gap = target - prev
+    if gap <= 0:
+        # We’re already at/above target; hold line
+        next_offer = prev
+    else:
+        # Concession schedule by round (monotonic ↑)
+        ratio = {1: 0.35, 2: 0.25, 3: 0.20}.get(rnd, 0.15)
+        increment = max(25, round_to_25(gap * ratio))
+        next_offer = min(cap, prev + increment)
+
+    # MONOTONIC GUARANTEE
+    if next_offer < prev:
+        next_offer = prev
+
+    # On final round, go to cap if still below target
+    if rnd >= 3 and next_offer < target:
+        next_offer = min(cap, max(prev, next_offer))
+
+    resp = {
+        "decision": "counter",
+        "next_offer": next_offer,
+        "round_next": rnd + 1,
+        "cap_rate": cap,
+        "reason": "counter toward target within cap",
+        "session_id": sid
+    }
+    log_negotiation_round(
+        sid, rnd, p.load_id, listed,
+        prev, ask,
+        resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
+    )
+    return resp
 
 @app.post("/classify_and_log")
 def classify_and_log(p: LogPayload, x_api_key: Optional[str] = Header(None)):
