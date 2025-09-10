@@ -722,10 +722,6 @@ def dashboard():
                             <span class="metric-label">Callbacks</span>
                             <span class="metric-value warning">${outcomes.callback || 0}</span>
                         </div>
-                        <div class="metric-row">
-                            <span class="metric-label">Counters</span>
-                            <span class="metric-value">${outcomes.counter || 0}</span>
-                        </div>
                     `;
                     
                     // Update sentiment
