@@ -323,18 +323,491 @@ def metrics():
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
-    <html><body>
-      <h2>Inbound Carrier Sales – Dashboard</h2>
-      <pre id="sum">Loading summary…</pre>
-      <pre id="rec">Loading recent…</pre>
-      <script>
-       async function go(){
-         const s = await (await fetch('/log/summary')).json();
-         const r = await (await fetch('/log/recent?limit=10')).json();
-         document.getElementById('sum').textContent = JSON.stringify(s, null, 2);
-         document.getElementById('rec').textContent = JSON.stringify(r, null, 2);
-       }
-       go();
-      </script>
-    </body></html>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Inbound Carrier Sales Dashboard</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+            
+            .header {
+                text-align: center;
+                margin-bottom: 40px;
+                color: white;
+            }
+            
+            .header h1 {
+                font-size: 2.5rem;
+                font-weight: 700;
+                margin-bottom: 8px;
+                text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            }
+            
+            .header p {
+                font-size: 1.1rem;
+                opacity: 0.9;
+            }
+            
+            .dashboard-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+                gap: 24px;
+                margin-bottom: 40px;
+            }
+            
+            .card {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                border-radius: 16px;
+                padding: 24px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+                border: 1px solid rgba(255,255,255,0.2);
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
+            }
+            
+            .card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+            }
+            
+            .card-header {
+                display: flex;
+                align-items: center;
+                margin-bottom: 20px;
+            }
+            
+            .card-icon {
+                width: 48px;
+                height: 48px;
+                border-radius: 12px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin-right: 16px;
+                font-size: 24px;
+            }
+            
+            .stats-icon {
+                background: linear-gradient(45deg, #ff6b6b, #ee5a6f);
+            }
+            
+            .outcomes-icon {
+                background: linear-gradient(45deg, #4ecdc4, #44a08d);
+            }
+            
+            .sentiment-icon {
+                background: linear-gradient(45deg, #45b7d1, #96c93d);
+            }
+            
+            .pricing-icon {
+                background: linear-gradient(45deg, #f093fb, #f5576c);
+            }
+            
+            .card-title {
+                font-size: 1.3rem;
+                font-weight: 600;
+                color: #2d3748;
+            }
+            
+            .metric-row {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 12px 0;
+                border-bottom: 1px solid #e2e8f0;
+            }
+            
+            .metric-row:last-child {
+                border-bottom: none;
+            }
+            
+            .metric-label {
+                font-weight: 500;
+                color: #4a5568;
+            }
+            
+            .metric-value {
+                font-weight: 600;
+                font-size: 1.1rem;
+                color: #2d3748;
+            }
+            
+            .metric-value.success {
+                color: #38a169;
+            }
+            
+            .metric-value.warning {
+                color: #d69e2e;
+            }
+            
+            .metric-value.danger {
+                color: #e53e3e;
+            }
+            
+            .recent-section {
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                border-radius: 16px;
+                padding: 24px;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+                border: 1px solid rgba(255,255,255,0.2);
+            }
+            
+            .section-title {
+                font-size: 1.4rem;
+                font-weight: 600;
+                color: #2d3748;
+                margin-bottom: 20px;
+                display: flex;
+                align-items: center;
+            }
+            
+            .section-title::before {
+                content: "📋";
+                margin-right: 12px;
+                font-size: 1.2rem;
+            }
+            
+            .table {
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            }
+            
+            .table th {
+                background: #f7fafc;
+                padding: 12px 16px;
+                text-align: left;
+                font-weight: 600;
+                color: #4a5568;
+                border-bottom: 2px solid #e2e8f0;
+            }
+            
+            .table td {
+                padding: 12px 16px;
+                border-bottom: 1px solid #e2e8f0;
+                color: #2d3748;
+            }
+            
+            .table tr:hover {
+                background: #f7fafc;
+            }
+            
+            .status-badge {
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.85rem;
+                font-weight: 500;
+                text-transform: capitalize;
+            }
+            
+            .status-accept {
+                background: #c6f6d5;
+                color: #22543d;
+            }
+            
+            .status-decline {
+                background: #fed7d7;
+                color: #742a2a;
+            }
+            
+            .status-callback {
+                background: #feebc8;
+                color: #7c2d12;
+            }
+            
+            .status-pending {
+                background: #e2e8f0;
+                color: #4a5568;
+            }
+            
+            .sentiment-positive {
+                color: #38a169;
+                font-weight: 600;
+            }
+            
+            .sentiment-negative {
+                color: #e53e3e;
+                font-weight: 600;
+            }
+            
+            .sentiment-neutral {
+                color: #718096;
+                font-weight: 600;
+            }
+            
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #718096;
+                font-style: italic;
+            }
+            
+            .refresh-btn {
+                position: fixed;
+                bottom: 24px;
+                right: 24px;
+                background: linear-gradient(45deg, #667eea, #764ba2);
+                color: white;
+                border: none;
+                width: 56px;
+                height: 56px;
+                border-radius: 50%;
+                font-size: 24px;
+                cursor: pointer;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+                transition: transform 0.2s ease;
+            }
+            
+            .refresh-btn:hover {
+                transform: scale(1.1);
+            }
+            
+            @media (max-width: 768px) {
+                .dashboard-grid {
+                    grid-template-columns: 1fr;
+                }
+                
+                .header h1 {
+                    font-size: 2rem;
+                }
+                
+                .table {
+                    font-size: 0.9rem;
+                }
+                
+                .table th,
+                .table td {
+                    padding: 8px 12px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🚛 Inbound Carrier Sales</h1>
+                <p>Real-time performance dashboard</p>
+            </div>
+            
+            <div class="dashboard-grid">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon stats-icon">📊</div>
+                        <div class="card-title">Key Statistics</div>
+                    </div>
+                    <div id="stats-content" class="loading">Loading statistics...</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon outcomes-icon">🎯</div>
+                        <div class="card-title">Call Outcomes</div>
+                    </div>
+                    <div id="outcomes-content" class="loading">Loading outcomes...</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon sentiment-icon">😊</div>
+                        <div class="card-title">Sentiment Analysis</div>
+                    </div>
+                    <div id="sentiment-content" class="loading">Loading sentiment...</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon pricing-icon">💰</div>
+                        <div class="card-title">Pricing Metrics</div>
+                    </div>
+                    <div id="pricing-content" class="loading">Loading pricing...</div>
+                </div>
+            </div>
+            
+            <div class="recent-section">
+                <div class="section-title">Recent Sessions</div>
+                <div id="recent-content" class="loading">Loading recent sessions...</div>
+            </div>
+        </div>
+        
+        <button class="refresh-btn" onclick="loadDashboard()" title="Refresh Dashboard">🔄</button>
+        
+        <script>
+            function formatCurrency(value) {
+                return new Intl.NumberFormat('en-US', {
+                    style: 'currency',
+                    currency: 'USD',
+                    minimumFractionDigits: 0
+                }).format(value);
+            }
+            
+            function formatPercentage(value) {
+                return (value * 100).toFixed(1) + '%';
+            }
+            
+            function formatTimestamp(timestamp) {
+                if (!timestamp) return 'N/A';
+                return new Date(timestamp * 1000).toLocaleString();
+            }
+            
+            function getStatusBadge(outcome) {
+                if (!outcome) return '<span class="status-badge status-pending">Pending</span>';
+                const className = `status-${outcome.toLowerCase()}`;
+                return `<span class="status-badge ${className}">${outcome}</span>`;
+            }
+            
+            function getSentimentClass(sentiment) {
+                if (!sentiment) return '';
+                return `sentiment-${sentiment.toLowerCase()}`;
+            }
+            
+            async function loadDashboard() {
+                try {
+                    // Load summary data
+                    const summaryResponse = await fetch('/log/summary');
+                    const summary = await summaryResponse.json();
+                    
+                    // Update stats
+                    document.getElementById('stats-content').innerHTML = `
+                        <div class="metric-row">
+                            <span class="metric-label">Total Sessions</span>
+                            <span class="metric-value">${summary.totals.sessions}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Accept Rate</span>
+                            <span class="metric-value success">${formatPercentage(summary.totals.accept_rate)}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Avg Rounds</span>
+                            <span class="metric-value">${summary.totals.avg_rounds}</span>
+                        </div>
+                    `;
+                    
+                    // Update outcomes
+                    const outcomes = summary.mix.outcomes;
+                    document.getElementById('outcomes-content').innerHTML = `
+                        <div class="metric-row">
+                            <span class="metric-label">Accepted</span>
+                            <span class="metric-value success">${outcomes.accept || 0}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Declined</span>
+                            <span class="metric-value danger">${outcomes.decline || 0}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Callbacks</span>
+                            <span class="metric-value warning">${outcomes.callback || 0}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Counters</span>
+                            <span class="metric-value">${outcomes.counter || 0}</span>
+                        </div>
+                    `;
+                    
+                    // Update sentiment
+                    const sentiment = summary.mix.sentiment;
+                    document.getElementById('sentiment-content').innerHTML = `
+                        <div class="metric-row">
+                            <span class="metric-label">Positive</span>
+                            <span class="metric-value success">${sentiment.positive || 0}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Neutral</span>
+                            <span class="metric-value">${sentiment.neutral || 0}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Negative</span>
+                            <span class="metric-value danger">${sentiment.negative || 0}</span>
+                        </div>
+                    `;
+                    
+                    // Update pricing
+                    document.getElementById('pricing-content').innerHTML = `
+                        <div class="metric-row">
+                            <span class="metric-label">Avg Delta</span>
+                            <span class="metric-value">${formatCurrency(summary.pricing.avg_delta_abs)}</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-label">Avg Delta %</span>
+                            <span class="metric-value">${formatPercentage(summary.pricing.avg_delta_pct)}</span>
+                        </div>
+                    `;
+                    
+                    // Load recent sessions
+                    const recentResponse = await fetch('/log/recent?limit=10');
+                    const recent = await recentResponse.json();
+                    
+                    if (recent.items && recent.items.length > 0) {
+                        const tableHTML = `
+                            <table class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Session</th>
+                                        <th>Lane</th>
+                                        <th>Listed Rate</th>
+                                        <th>Final Rate</th>
+                                        <th>Outcome</th>
+                                        <th>Sentiment</th>
+                                        <th>Started</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${recent.items.map(item => `
+                                        <tr>
+                                            <td style="font-family: monospace; font-size: 0.9rem;">${item.session_id.substring(0, 8)}...</td>
+                                            <td>${item.lane || 'N/A'}</td>
+                                            <td>${item.listed_rate ? formatCurrency(item.listed_rate) : 'N/A'}</td>
+                                            <td>${item.final_rate ? formatCurrency(item.final_rate) : 'N/A'}</td>
+                                            <td>${getStatusBadge(item.outcome)}</td>
+                                            <td><span class="${getSentimentClass(item.sentiment)}">${item.sentiment || 'N/A'}</span></td>
+                                            <td>${formatTimestamp(item.started_at)}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        `;
+                        document.getElementById('recent-content').innerHTML = tableHTML;
+                    } else {
+                        document.getElementById('recent-content').innerHTML = '<p class="loading">No recent sessions found</p>';
+                    }
+                    
+                } catch (error) {
+                    console.error('Error loading dashboard:', error);
+                    document.getElementById('stats-content').innerHTML = '<p style="color: #e53e3e;">Error loading data</p>';
+                    document.getElementById('outcomes-content').innerHTML = '<p style="color: #e53e3e;">Error loading data</p>';
+                    document.getElementById('sentiment-content').innerHTML = '<p style="color: #e53e3e;">Error loading data</p>';
+                    document.getElementById('pricing-content').innerHTML = '<p style="color: #e53e3e;">Error loading data</p>';
+                    document.getElementById('recent-content').innerHTML = '<p style="color: #e53e3e;">Error loading data</p>';
+                }
+            }
+            
+            // Load dashboard on page load
+            loadDashboard();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(loadDashboard, 30000);
+        </script>
+    </body>
+    </html>
     """
