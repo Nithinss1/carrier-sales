@@ -1,4 +1,3 @@
-# app/telemetry.py
 import os, sqlite3, time, json, uuid
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Header, HTTPException, Depends
@@ -20,12 +19,18 @@ def require_key(x_api_key: Optional[str] = Header(None)):
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
+# Add new columns for session summary and ended_at if not present
 conn.execute("""
 CREATE TABLE IF NOT EXISTS sessions(
   session_id TEXT PRIMARY KEY,
   started_at REAL,
-  caller TEXT
-)""")
+  ended_at REAL,
+  caller TEXT,
+  outcome TEXT,
+  final_rate REAL,
+  load_id TEXT
+)
+""")
 conn.execute("""
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,7 +38,8 @@ CREATE TABLE IF NOT EXISTS events(
   ts REAL,
   type TEXT,
   data TEXT
-)""")
+)
+""")
 conn.commit()
 
 # -----------------------------
@@ -62,7 +68,26 @@ def log_event(session_id: str, event_type: str, data: Dict[str, Any]):
 
 def end_session(session_id: str, summary: Optional[Dict[str, Any]] = None):
     if summary:
+        # Update session with summary fields and ended_at
+        conn.execute(
+            "UPDATE sessions SET ended_at=?, outcome=?, final_rate=?, load_id=? WHERE session_id=?",
+            (
+                time.time(),
+                summary.get("outcome"),
+                summary.get("final_rate"),
+                summary.get("load_id"),
+                session_id,
+            )
+        )
+        conn.commit()
         log_event(session_id, "summary", summary)
+    else:
+        # Even if no summary, mark as ended
+        conn.execute(
+            "UPDATE sessions SET ended_at=? WHERE session_id=?",
+            (time.time(), session_id)
+        )
+        conn.commit()
 
 # Convenience wrappers you already used
 def log_verify_result(sid, mc, status, eligible, tier, risk_score):
@@ -112,15 +137,33 @@ def events_api(body: Dict[str, Any] = Body(...)):
 @router.get("/events/{session_id}")
 def get_events(session_id: str):
     s = conn.execute(
-        "SELECT session_id, started_at, caller FROM sessions WHERE session_id=?",
+        "SELECT session_id, started_at, ended_at, caller, outcome, final_rate, load_id FROM sessions WHERE session_id=?",
         (session_id,)
     ).fetchone()
     evs = conn.execute(
         "SELECT ts, type, data FROM events WHERE session_id=? ORDER BY id ASC",
         (session_id,)
     ).fetchall()
+    # Build session payload + nested summary for compatibility
+    summary = None
+    if s and (s[4] is not None or s[5] is not None or s[6] is not None):
+        summary = {
+            "outcome": s[4],
+            "final_rate": s[5],
+            "load_id": s[6],
+        }
+    session_payload = {
+        "session_id": s[0] if s else None,
+        "started_at": s[1] if s else None,
+        "ended_at": s[2] if s else None,
+        "caller": s[3] if s else None,
+        "outcome": s[4] if s else None,
+        "final_rate": s[5] if s else None,
+        "load_id": s[6] if s else None,
+        "summary": summary,
+    } if s else None
     return {
-        "session": {"session_id": s[0], "started_at": s[1], "caller": s[2]} if s else None,
+        "session": session_payload,
         "events": [{"ts": r[0], "type": r[1], "data": json.loads(r[2])} for r in evs]
     }
 
@@ -206,7 +249,7 @@ def log_recent(limit: int = 10):
         last_sent AS (
           SELECT session_id, MAX(id) id FROM events WHERE type='sentiment' GROUP BY session_id
         )
-        SELECT s.session_id, s.started_at,
+        SELECT s.session_id, s.started_at, s.ended_at,
                json_extract(lo.data,'$.outcome') AS outcome,
                json_extract(lo.data,'$.final_rate') AS final_rate,
                json_extract(lp.data,'$.loads[0].loadboard_rate') AS listed_rate,
@@ -224,6 +267,6 @@ def log_recent(limit: int = 10):
         LIMIT ?
     """, (limit,)).fetchall()
     return {"items": [{
-        "session_id": r[0], "started_at": r[1], "outcome": r[2],
-        "final_rate": r[3], "listed_rate": r[4], "lane": r[5], "sentiment": r[6]
+        "session_id": r[0], "started_at": r[1], "ended_at": r[2],
+        "outcome": r[3], "final_rate": r[4], "listed_rate": r[5], "lane": r[6], "sentiment": r[7]
     } for r in rows]}
