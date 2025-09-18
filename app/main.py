@@ -239,7 +239,23 @@ def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None), x_session_id: O
     equip  = p.equipment_type or ""
     rnd    = int(p.round)
 
-    cap = compute_cap(listed, miles, equip)  # ← STABLE per load/session
+    cap = compute_cap(listed, miles, equip)
+    
+    if ask > cap:
+        resp = {
+            "decision": "decline",
+            "next_offer": min(cap, prev + max(25, round_to_25((ask - prev) * 0.15))),
+            "round_next": rnd + 1,
+            "cap_rate": cap,
+            "reason": "carrier ask above cap",
+            "session_id": sid
+        } 
+        log_negotiation_round{
+            sid, rnd, p.load_id, listed,
+            prev, ask,
+            resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
+        }
+        return resp
 
     # If carrier is already at/below our current price, or very close late in the game, accept.
     if ask <= cap and (ask <= prev or (rnd >= 3 and (ask - prev) <= 50)):
