@@ -255,6 +255,7 @@ def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None), x_session_id: O
             prev, ask,
             resp.get("decision"), resp.get("next_offer"), resp.get("cap_rate")
         )
+        return resp
 
     # If carrier is already at/below our current price, or very close late in the game, accept.
     if ask <= cap and (ask <= prev or (rnd >= 3 and (ask - prev) <= 50)):
