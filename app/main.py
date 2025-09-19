@@ -26,6 +26,32 @@ from .telemetry import router as telemetry_router
 app = FastAPI(title="Inbound Carrier Sales API", version="0.1.0")
 app.include_router(telemetry_router)
 
+def store_session_cap(session_id: str, cap_rate: int):
+    """Store cap rate in database"""
+    try:
+        conn = db_conn()
+        conn.execute(
+            "UPDATE sessions SET cap_rate = ? WHERE session_id = ?",
+            (cap_rate, session_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error storing cap rate: {e}")
+
+def get_session_cap(session_id: str) -> Optional[int]:
+    """Get cap rate from database"""
+    try:
+        conn = db_conn()
+        result = conn.execute(
+            "SELECT cap_rate FROM sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        conn.close()
+        return result[0] if result and result[0] else None
+    except Exception as e:
+        print(f"Error getting cap rate: {e}")
+        return None
 
 def _require(x_api_key: str | None):
     if x_api_key != API_KEY:
@@ -95,6 +121,8 @@ def db_conn():
 
 def init_db():
     conn = db_conn()
+    
+    # Create calls table (existing)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS calls(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +138,27 @@ def init_db():
             ts TEXT
         )
     """)
+    
+    # Create sessions table (for cap rate storage)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions(
+            session_id TEXT PRIMARY KEY,
+            started_at REAL,
+            ended_at REAL,
+            caller TEXT,
+            outcome TEXT,
+            final_rate REAL,
+            load_id TEXT,
+            cap_rate INTEGER
+        )
+    """)
+    
+    # Try to add cap_rate column if sessions table already exists without it
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN cap_rate INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
     conn.commit()
     conn.close()
 
@@ -240,7 +289,16 @@ def evaluate_offer(p: EvaluateIn, x_api_key: str = Header(None), x_session_id: O
     rnd    = int(p.round)
 
     cap = compute_cap(listed, miles, equip)
-    
+
+    if rnd == 1:
+        store_session_cap(sid, cap)   
+
+    else:
+        stored_cap = get_session_cap(sid)
+        if stored_cap:
+            cap = stored_cap
+        else:
+            store_session_cap(sid, cap)   
     if ask > cap:
         resp = {
             "decision": "decline",
